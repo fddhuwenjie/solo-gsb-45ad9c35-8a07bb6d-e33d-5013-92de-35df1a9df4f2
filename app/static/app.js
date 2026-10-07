@@ -99,8 +99,11 @@ function renderBatches() {
   }
   tb.innerHTML = state.batches.map((b) => {
     const used = b.used_by_load != null;
+    const src = b.refire_source;
     return `<tr>
-      <td>${esc(b.code)}</td>
+      <td>${esc(b.code)}${src
+        ? `<br><span class="tag tag-refire" title="来源实绩明细：窑次 #${src.load_id}（${esc(src.load_name)}）${src.pos_no} 号位批次 ${esc(src.batch_code)}，实绩登记于 ${new Date(src.registered_at).toLocaleString()}">复烧自 窑次#${src.load_id} · ${esc(src.batch_code)}</span>`
+        : ""}</td>
       <td>${b.peak_min} ~ ${b.peak_max}</td>
       <td>${b.hold_min} ~ ${b.hold_max}</td>
       <td>v${b.version}</td>
@@ -109,7 +112,9 @@ function renderBatches() {
         : `<span class="tag tag-open">待烧</span>`}</td>
       <td>
         <button data-edit="${b.id}">改工艺</button>
-        <button data-del="${b.id}">删除</button>
+        ${src
+          ? `<span class="hint" title="复烧批次须保留与来源实绩明细的追溯关系">不可删</span>`
+          : `<button data-del="${b.id}">删除</button>`}
       </td>
     </tr>`;
   }).join("");
@@ -682,37 +687,79 @@ async function submitResult(schedId) {
   }
 }
 
-// 在安排卡片旁展开逐批判定结果
-async function toggleResultView(schedId) {
+// 在安排卡片旁展开逐批判定结果（超界明细可在此生成复烧批次）
+async function showResultView(schedId) {
   const detail = $(`sched-detail-${schedId}`);
-  if (!detail.classList.contains("hidden")) { closeSchedDetail(detail); return; }
   try {
     const r = await api("GET", `/api/schedules/${schedId}/result`);
     const over = r.items.filter((i) => !i.peak_ok || !i.hold_ok);
     const verdict = (ok) =>
       ok ? `<span class="tag tag-open">在界内</span>` : `<span class="tag tag-used">超界</span>`;
+    // 复烧列：已生成 → 新批次编号；超界未生成 → 填写新编号；界内 → 无需复烧
+    const refireCell = (i) => {
+      if (i.refire) {
+        return `<span class="tag tag-refire" title="已生成待复烧批次，见 ① 批次列表">→ ${esc(i.refire.batch_code)}</span>`;
+      }
+      if (!i.peak_ok || !i.hold_ok) {
+        return `<span class="refire-form">
+          <input id="rf-code-${i.result_item_id}" placeholder="新编号" style="width:90px" />
+          <button data-refire="${i.result_item_id}">生成复烧批次</button>
+        </span>`;
+      }
+      return `<span style="color:#8a8175">—</span>`;
+    };
     detail.innerHTML = `
       <div class="meta">登记于 ${new Date(r.registered_at).toLocaleString()}</div>
       <div class="meta">拟用：峰温 ${r.peak_temp} °C · 保温 ${r.hold_minutes} 分钟<br>
         实测：峰温 <b>${r.actual_peak}</b> °C · 保温 <b>${r.actual_hold}</b> 分钟</div>
       <table>
-        <thead><tr><th>窑位</th><th>批次</th><th>峰温区间(°C)</th><th>峰温判定</th><th>保温区间(min)</th><th>保温判定</th></tr></thead>
+        <thead><tr><th>窑位</th><th>批次</th><th>峰温区间(°C)</th><th>峰温判定</th><th>保温区间(min)</th><th>保温判定</th><th>复烧</th></tr></thead>
         <tbody>${r.items
           .map(
             (i) => `<tr class="${i.peak_ok && i.hold_ok ? "" : "over"}">
             <td>${i.pos_no}</td><td>${esc(i.batch_code)}</td>
             <td>${i.peak_min} ~ ${i.peak_max}</td><td>${verdict(i.peak_ok)}</td>
             <td>${i.hold_min} ~ ${i.hold_max}</td><td>${verdict(i.hold_ok)}</td>
+            <td>${refireCell(i)}</td>
           </tr>`
           )
           .join("")}</tbody>
       </table>
       <div class="meta">${over.length
-        ? `超界项目：${over.map((i) => esc(i.batch_code)).join("、")}`
+        ? `超界项目：${over.map((i) => esc(i.batch_code)).join("、")}——可在“复烧”列填写新编号生成待复烧批次（继承该批确认清单中的工艺区间，每条明细限一次）`
         : "全部批次均在工艺区间内"}（判定以确认清单快照为准，批次后续修改不改变判定）</div>`;
     detail.classList.remove("hidden");
+    detail.querySelectorAll("[data-refire]").forEach((btn) =>
+      btn.addEventListener("click", () => submitRefire(Number(btn.dataset.refire), schedId))
+    );
   } catch (e) {
     toast(e.message, "err");
+  }
+}
+
+async function toggleResultView(schedId) {
+  const detail = $(`sched-detail-${schedId}`);
+  if (!detail.classList.contains("hidden")) { closeSchedDetail(detail); return; }
+  await showResultView(schedId);
+}
+
+// 为一条超界实绩明细生成待复烧批次
+async function submitRefire(itemId, schedId) {
+  const input = $(`rf-code-${itemId}`);
+  const code = (input.value || "").trim();
+  if (!code) { toast("请先在输入框填写新批次编号", "err"); return; }
+  try {
+    const b = await api("POST", `/api/result-items/${itemId}/refire`, { code });
+    toast(
+      `复烧批次 ${b.code} 已生成：峰温 ${b.peak_min}~${b.peak_max} °C、保温 ${b.hold_min}~${b.hold_max} 分钟（继承确认清单快照），可在 ① 中查看并放入草案`,
+      "ok"
+    );
+    await reloadBatches();
+    await showResultView(schedId);
+  } catch (e) {
+    // 已被他人生成 / 编号重复：刷新为数据库最新状态
+    toast(e.message, "err");
+    await showResultView(schedId);
   }
 }
 

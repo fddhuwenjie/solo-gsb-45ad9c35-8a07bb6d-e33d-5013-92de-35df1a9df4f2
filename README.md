@@ -3,7 +3,8 @@
 用于陶瓷车间“合窑”前的装载登记与确认：登记待烧批次允许的**峰温闭区间**与**保温分钟闭区间**，
 把批次放入某台窑的装窑草案，预览共同可用工艺区间与窑位占位，校验通过后一次性确认生成
 **不可变装载清单**；随后可为已确认窑次安排**烧成时段**（带时区的开始/结束时间与拟用工艺参数），
-烧成后为安排登记**实绩**（实际峰温/保温）并自动逐批判定超界。
+烧成后为安排登记**实绩**（实际峰温/保温）并自动逐批判定超界；超界批次可一键生成**待复烧批次**
+（继承确认清单中的工艺区间）再次入窑。
 后端 Python Flask + SQLite，前端原生 JavaScript（无构建步骤）。
 
 ## 一键启动
@@ -91,6 +92,23 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
    逐批判定表（在界内/超界）与超界项目汇总。数据保存在 `firing_results` / `firing_result_items`
    表，重启后仍可查询。
 
+## 复烧批次（实绩判定表的“复烧”列）
+
+实绩中有批次峰温或保温**超界**时，可在该批旁填写新编号，生成**待复烧批次**：
+
+1. **生成**：在“查看实绩”的逐批判定表中，超界行的“复烧”列填写**新批次编号**并提交。
+   新批次继承原窑次**确认清单中该批**的峰温/保温闭区间（判定快照值，与批次当前范围无关），
+   并记录来源实绩明细；原批次仍归属原窑次，原确认清单与实绩判定保持原样。
+2. **限制**：每条超界明细**最多生成一个**新批次；界内批次、重复编号均会被拒绝（409），
+   并发重复申请只有一个能成功，失败不留部分记录。
+3. **追溯**：实绩判定表的“复烧”列显示已生成的新批次编号；批次列表中新批次编号下标注
+   “复烧自 窑次#N · 原批次”（悬停可见来源窑位与实绩登记时间）。
+4. **再烧**：复烧批次是普通待烧批次，可正常放入草案、预览、确认、排程与登记实绩；
+   之后修改原批次的工艺范围不影响复烧批次。
+5. **不可删除**：复烧批次即使尚未确认入窑也不可删除（页面不显示删除按钮，直接调用
+   `DELETE /api/batches/{id}` 也返回 409），避免与来源实绩明细的追溯断链。
+   对应关系保存在 `refire_links` 表，重启后保留。
+
 ## 主要 HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -107,7 +125,10 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
 | GET | `/api/loads`、`/api/loads/{id}` | 已确认窑次列表 / 快照详情 |
 | GET/POST | `/api/schedules` | 烧成安排列表（按窑和时间排序，含 `result_id` 标记）/ 新建安排 `{load_id, start_at, end_at, peak_temp, hold_minutes}`（时间须带时区） |
 | PUT | `/api/schedules/{id}` | 修改安排的时段与参数（重查失败则原安排不变；已登记实绩的安排返回 409） |
-| GET/POST | `/api/schedules/{id}/result` | 查看 / 登记该安排的烧成实绩。登记体：`{start_at, end_at, peak_temp, hold_minutes, actual_peak, actual_hold}`——前四项须为页面读取的安排当前值，变动则 409 提示刷新；返回登记时间与逐批判定明细 |
+| GET/POST | `/api/schedules/{id}/result` | 查看 / 登记该安排的烧成实绩。登记体：`{start_at, end_at, peak_temp, hold_minutes, actual_peak, actual_hold}`——前四项须为页面读取的安排当前值，变动则 409 提示刷新；返回登记时间与逐批判定明细（每条含 `result_item_id` 与已生成复烧批次的 `refire` 标记） |
+| POST | `/api/result-items/{id}/refire` | 为超界实绩明细生成待复烧批次 `{code}`：新批次继承判定快照的工艺闭区间并记录来源；界内明细、重复编号、同一明细重复申请均返回 409，并发只有一个成功 |
+
+批次列表中复烧批次带 `refire_source`（来源实绩明细、窑次与登记时间），且不可删除（`DELETE` 返回 409）。
 
 过期预览确认返回示例：
 
@@ -135,9 +156,21 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
   "registered_at": "2026-10-09T02:30:00.000000Z",
   "peak_temp": 1240.0, "hold_minutes": 35,
   "items": [
-    { "batch_code": "B-001", "pos_no": 1, "peak_min": 1200.0, "peak_max": 1250.0,
-      "hold_min": 30, "hold_max": 45, "peak_ok": false, "hold_ok": true }
+    { "result_item_id": 1, "batch_code": "B-001", "pos_no": 1, "peak_min": 1200.0, "peak_max": 1250.0,
+      "hold_min": 30, "hold_max": 45, "peak_ok": false, "hold_ok": true, "refire": null }
   ]
+}
+```
+
+复烧批次生成成功返回示例（继承快照区间，带来源追溯）：
+
+```json
+{
+  "id": 7, "code": "B-001-R", "peak_min": 1200.0, "peak_max": 1250.0,
+  "hold_min": 30, "hold_max": 45, "version": 1, "used_by_load": null,
+  "refire_source": { "result_item_id": 1, "batch_code": "B-001", "pos_no": 1,
+                     "result_id": 1, "schedule_id": 1, "load_id": 1, "load_name": "早班合窑",
+                     "registered_at": "2026-10-09T02:30:00.000000Z" }
 }
 ```
 
@@ -146,9 +179,11 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
 ```
 Dockerfile / docker-compose.yml   一键启动
 wsgi.py                           gunicorn 入口
-schema.sql                        建表脚本（启动时自动执行）
+schema.sql                        建表脚本（启动时自动执行，含复烧追溯表 refire_links）
 requirements.txt
-app/__init__.py                   Flask 路由、预览与确认事务
+app/__init__.py                   Flask 路由、预览与确认事务、实绩判定与复烧生成
 app/db.py                         SQLite 连接/初始化、固定窑位种子数据
 app/static/                       原生前端（index.html / app.js / styles.css）
+test_e2e.py / test_schedule.py / test_result.py / test_concurrent.py / test_refire.py
+                                  业务规则与并发验证（临时 SQLite，直接 python 运行）
 ```

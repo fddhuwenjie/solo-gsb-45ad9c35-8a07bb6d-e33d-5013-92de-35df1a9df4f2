@@ -19,6 +19,13 @@
   安排有变动则提示刷新、不生成实绩；每个安排只能登记一次，登记成功后该
   安排不得修改；并发登记或登记与排程修改交错时在 BEGIN IMMEDIATE 事务内
   按数据库最新状态裁决，失败不留部分记录。
+- 复烧批次：实绩中峰温或保温超界的明细可填写新编号生成待复烧批次。
+  新批次继承判定快照（即原窑次确认清单中该批）的工艺闭区间，此后与原批次
+  相互独立；原批次仍归属原窑次，确认清单与判定保持原样。refire_links 记录
+  新批次与来源实绩明细的对应关系供双向追溯；每条超界明细最多生成一个
+  （UNIQUE(result_item_id) 兜底，并发重复申请在 BEGIN IMMEDIATE 事务内裁决，
+  失败不留部分记录）；界内明细、重复编号均不能生成。复烧批次即使尚未确认
+  也不可删除，避免来源断链。
 """
 import math
 import numbers
@@ -260,16 +267,46 @@ def create_app():
             result.append({**dict(k), "positions": positions})
         return jsonify(result)
 
+    # 批次行 + 复烧来源（若是复烧批次）：来源实绩明细、窑次与登记时间
+    BATCH_SELECT = """
+        SELECT b.*, cli.load_id AS used_by_load,
+               rl.id AS refire_id,
+               fri.id AS src_item_id, fri.batch_code AS src_batch_code,
+               fri.pos_no AS src_pos_no,
+               fr.id AS src_result_id, fr.registered_at AS src_registered_at,
+               fs.id AS src_schedule_id, fs.load_id AS src_load_id,
+               cl.name AS src_load_name
+          FROM batches b
+          LEFT JOIN confirmed_load_items cli ON cli.batch_id = b.id
+          LEFT JOIN refire_links rl ON rl.batch_id = b.id
+          LEFT JOIN firing_result_items fri ON fri.id = rl.result_item_id
+          LEFT JOIN firing_results fr ON fr.id = fri.result_id
+          LEFT JOIN firing_schedules fs ON fs.id = fr.schedule_id
+          LEFT JOIN confirmed_loads cl ON cl.id = fs.load_id
+    """
+
+    def batch_json(row):
+        """批次行 -> API 字典；复烧批次附带 refire_source 供追溯来源。"""
+        d = dict(row)
+        refire_id = d.pop("refire_id")
+        src = {
+            "result_item_id": d.pop("src_item_id"),
+            "batch_code": d.pop("src_batch_code"),
+            "pos_no": d.pop("src_pos_no"),
+            "result_id": d.pop("src_result_id"),
+            "registered_at": d.pop("src_registered_at"),
+            "schedule_id": d.pop("src_schedule_id"),
+            "load_id": d.pop("src_load_id"),
+            "load_name": d.pop("src_load_name"),
+        }
+        d["refire_source"] = src if refire_id is not None else None
+        return d
+
     @app.route("/api/batches", methods=["GET"])
     def list_batches():
         db = get_db()
-        rows = db.execute(
-            """SELECT b.*, cli.load_id AS used_by_load
-               FROM batches b
-               LEFT JOIN confirmed_load_items cli ON cli.batch_id = b.id
-               ORDER BY b.id"""
-        ).fetchall()
-        return jsonify([dict(r) for r in rows])
+        rows = db.execute(BATCH_SELECT + " ORDER BY b.id").fetchall()
+        return jsonify([batch_json(r) for r in rows])
 
     @app.route("/api/batches", methods=["POST"])
     def create_batch():
@@ -333,6 +370,14 @@ def create_app():
     @app.route("/api/batches/<int:batch_id>", methods=["DELETE"])
     def delete_batch(batch_id):
         db = get_db()
+        refire = db.execute(
+            "SELECT 1 FROM refire_links WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if refire:
+            return err(
+                409,
+                "复烧批次不可删除（即使尚未确认入窑）：须保留与来源实绩明细的追溯关系",
+            )
         used = db.execute(
             "SELECT 1 FROM confirmed_load_items WHERE batch_id = ?", (batch_id,)
         ).fetchone()
@@ -985,15 +1030,30 @@ def create_app():
         if row is None:
             return err(404, "烧成实绩不存在")
         items = db.execute(
-            """SELECT batch_id, batch_code, pos_no, peak_min, peak_max,
-                      hold_min, hold_max, peak_ok, hold_ok
-                 FROM firing_result_items WHERE result_id = ? ORDER BY pos_no""",
+            """SELECT fri.id AS result_item_id, fri.batch_id, fri.batch_code, fri.pos_no,
+                      fri.peak_min, fri.peak_max, fri.hold_min, fri.hold_max,
+                      fri.peak_ok, fri.hold_ok,
+                      nb.id AS refire_batch_id, nb.code AS refire_batch_code
+                 FROM firing_result_items fri
+                 LEFT JOIN refire_links rl ON rl.result_item_id = fri.id
+                 LEFT JOIN batches nb ON nb.id = rl.batch_id
+                WHERE fri.result_id = ? ORDER BY fri.pos_no""",
             (result_id,),
         ).fetchall()
         body = {
             **dict(row),
             "items": [
-                {**dict(r), "peak_ok": bool(r["peak_ok"]), "hold_ok": bool(r["hold_ok"])}
+                {
+                    **{k: v for k, v in dict(r).items()
+                       if k not in ("refire_batch_id", "refire_batch_code")},
+                    "peak_ok": bool(r["peak_ok"]),
+                    "hold_ok": bool(r["hold_ok"]),
+                    "refire": (
+                        {"batch_id": r["refire_batch_id"],
+                         "batch_code": r["refire_batch_code"]}
+                        if r["refire_batch_id"] is not None else None
+                    ),
+                }
                 for r in items
             ],
         }
@@ -1092,5 +1152,84 @@ def create_app():
                 conflict=True,
             )
         return result_detail(db, result_id, created=True)
+
+    # ------------------------------------------------------------------
+    # 复烧批次：为超界实绩明细生成待复烧批次（继承判定快照的工艺闭区间）
+    # ------------------------------------------------------------------
+
+    @app.route("/api/result-items/<int:item_id>/refire", methods=["POST"])
+    def create_refire(item_id):
+        """生成待复烧批次。新批次是 batches 的普通一行，可正常走草案/确认/排程/
+        实绩流程；refire_links 记录来源实绩明细供双向追溯。"""
+        data = json_body()
+        code = (data.get("code") or "").strip()
+        if not code:
+            return err(400, "新批次编号不能为空")
+
+        db = get_db()
+        try:
+            # BEGIN IMMEDIATE：并发重复申请在此排队，重查与写入原子完成
+            db.execute("BEGIN IMMEDIATE")
+            item = db.execute(
+                """SELECT fri.id, fri.batch_code, fri.pos_no,
+                          fri.peak_min, fri.peak_max, fri.hold_min, fri.hold_max,
+                          fri.peak_ok, fri.hold_ok
+                     FROM firing_result_items fri
+                    WHERE fri.id = ?""",
+                (item_id,),
+            ).fetchone()
+            if item is None:
+                db.rollback()
+                return err(404, "实绩明细不存在")
+            if item["peak_ok"] and item["hold_ok"]:
+                db.rollback()
+                return err(
+                    409,
+                    f"批次 {item['batch_code']} 的峰温与保温均在工艺区间内，无需复烧",
+                )
+            dup = db.execute(
+                """SELECT b.code FROM refire_links rl
+                     JOIN batches b ON b.id = rl.batch_id
+                    WHERE rl.result_item_id = ?""",
+                (item_id,),
+            ).fetchone()
+            if dup:
+                db.rollback()
+                return err(
+                    409,
+                    f"该超界明细已生成过复烧批次 {dup['code']}，每条明细最多生成一个",
+                    conflict=True,
+                )
+            if db.execute(
+                "SELECT 1 FROM batches WHERE code = ?", (code,)
+            ).fetchone():
+                db.rollback()
+                return err(409, f"批次编号 {code} 已存在，请换一个编号")
+            # 工艺闭区间复制自判定快照（即原窑次确认清单中该批的范围），
+            # 此后与原批次相互独立：修改原批次范围不影响新批次
+            cur = db.execute(
+                """INSERT INTO batches(code, peak_min, peak_max, hold_min, hold_max)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (code, item["peak_min"], item["peak_max"],
+                 item["hold_min"], item["hold_max"]),
+            )
+            batch_id = cur.lastrowid
+            db.execute(
+                "INSERT INTO refire_links(result_item_id, batch_id) VALUES (?, ?)",
+                (item_id, batch_id),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            # UNIQUE(result_item_id) / UNIQUE(batches.code)：并发或重复申请的落败方
+            db.rollback()
+            return err(
+                409,
+                "并发冲突：该明细已被另一请求生成复烧批次，或编号已被占用，请刷新后查看",
+                conflict=True,
+            )
+        row = db.execute(
+            BATCH_SELECT + " WHERE b.id = ?", (batch_id,)
+        ).fetchone()
+        return jsonify(batch_json(row)), 201
 
     return app

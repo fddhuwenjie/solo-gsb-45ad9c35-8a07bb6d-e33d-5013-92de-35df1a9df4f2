@@ -130,3 +130,15 @@ CREATE TABLE IF NOT EXISTS firing_result_items (
     hold_ok     INTEGER NOT NULL CHECK (hold_ok IN (0, 1)),
     UNIQUE (result_id, batch_id)
 );
+
+-- 复烧批次：实绩中峰温或保温超界的明细可生成一个待复烧批次。
+-- 新批次是 batches 中的普通一行（工艺闭区间复制自判定快照，此后与原批次独立），
+-- 本表记录新批次与来源实绩明细的对应关系，供双向追溯。
+-- UNIQUE(result_item_id)：每条超界明细最多生成一个新批次（并发重复申请只有一个能提交）；
+-- UNIQUE(batch_id)：一个批次最多对应一条来源记录，追溯关系唯一。
+CREATE TABLE IF NOT EXISTS refire_links (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    result_item_id  INTEGER NOT NULL UNIQUE REFERENCES firing_result_items(id),
+    batch_id        INTEGER NOT NULL UNIQUE REFERENCES batches(id),
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

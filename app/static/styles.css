@@ -60,6 +60,7 @@ td button { padding: 3px 8px; font-size: 12px; background: #a85a43; }
 .tag-open { background: #e2efe4; color: #2e7d4f; }
 .tag-confirmed { background: #e7e1f0; color: #5a3d8a; }
 .tag-used { background: #f6e2db; color: #a23f22; }
+.tag-refire { background: #fdf0d8; color: #8a5a12; margin-top: 2px; }
 
 .pos-map { display: flex; flex-wrap: wrap; gap: 6px; }
 .pos-cell {
@@ -106,6 +107,9 @@ td button { padding: 3px 8px; font-size: 12px; background: #a85a43; }
 .sched-detail tr.over td { background: #f9e9e4; }
 .result-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: end; margin-top: 6px; }
 .result-form label { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+.refire-form { display: inline-flex; gap: 4px; align-items: center; }
+.refire-form input { padding: 3px 6px; font-size: 12px; }
+.refire-form button { padding: 3px 8px; font-size: 12px; background: #8a5a12; }
 
 .toast {
   position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
