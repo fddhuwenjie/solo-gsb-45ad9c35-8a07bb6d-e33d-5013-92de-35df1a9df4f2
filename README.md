@@ -91,6 +91,28 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
    逐批判定表（在界内/超界）与超界项目汇总。数据保存在 `firing_results` / `firing_result_items`
    表，重启后仍可查询。
 
+## 超界复烧批次生成（页面第 ④ 栏，实绩判定表中操作）
+
+实绩中某批的**峰温或保温超出工艺闭区间**时，可在该条明细旁直接填写一个**新批次编号**生成
+**待复烧批次**（判定表“复烧”列；一条超界明细对应一个输入框）：
+
+1. **继承区间**：新批次是一个普通待烧批次，其峰温、保温闭区间**继承自原窑次确认清单中该批的
+   工艺闭区间快照**（即实绩判定固化时使用的区间，不取原批次后来修改的范围）；系统同时固化记录
+   来源实绩明细（原批次、原窑次/窑炉/安排、登记时间、实测值与超界判定）。
+2. **原批次不动**：原批次仍归属原窑次，**原确认清单与实绩判定保持原样**；新批次之后可走现有
+   **草案 → 预览 → 确认 → 排程 → 实绩** 全部流程；之后再修改原批次的工艺范围**不影响**新批次。
+3. **生成条件**（服务器在单个 `BEGIN IMMEDIATE` 事务内重查，任一失败整体回滚，**不留部分记录**）：
+   - 只有峰温或保温**超界**的明细可生成，界内明细返回 409；
+   - **每条超界明细最多生成一个**复烧批次，重复申请返回 409；
+   - 新编号与已有批次重复返回 409；
+   - 两个并发申请（即使编号不同）由 `refire_batches.result_item_id` 全局唯一约束兜底，
+     **恰好一个成功**，败方不会留下批次或来源记录。
+4. **双向查看**：实绩判定表中已生成的明细显示“复烧批次 →”，点击跳到左栏该批次；
+   批次列表的“复烧来源”列对复烧批次显示来源原批次，点击展开**来源实绩明细并高亮对应行**。
+5. **不可删除**：复烧批次**即使尚未确认也不能删除**（删除接口返回 409），避免来源断链；
+   其工艺范围仍可像普通批次一样修改（版本递增）。数据保存在新增的 `refire_batches` 表，
+   **只新增表，不改动原确认清单与实绩表**，已有数据库重启后自动建表、原有数据照常使用。
+
 ## 主要 HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -107,7 +129,9 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
 | GET | `/api/loads`、`/api/loads/{id}` | 已确认窑次列表 / 快照详情 |
 | GET/POST | `/api/schedules` | 烧成安排列表（按窑和时间排序，含 `result_id` 标记）/ 新建安排 `{load_id, start_at, end_at, peak_temp, hold_minutes}`（时间须带时区） |
 | PUT | `/api/schedules/{id}` | 修改安排的时段与参数（重查失败则原安排不变；已登记实绩的安排返回 409） |
-| GET/POST | `/api/schedules/{id}/result` | 查看 / 登记该安排的烧成实绩。登记体：`{start_at, end_at, peak_temp, hold_minutes, actual_peak, actual_hold}`——前四项须为页面读取的安排当前值，变动则 409 提示刷新；返回登记时间与逐批判定明细 |
+| GET/POST | `/api/schedules/{id}/result` | 查看 / 登记该安排的烧成实绩。登记体：`{start_at, end_at, peak_temp, hold_minutes, actual_peak, actual_hold}`——前四项须为页面读取的安排当前值，变动则 409 提示刷新；返回登记时间与逐批判定明细（每项含 `result_item_id` 与已生成的 `refire_batch_id/code`） |
+| POST | `/api/result-items/{result_item_id}/refire` | 为一条超界实绩明细填写 `{code}` 生成复烧批次：继承确认清单中该批的工艺闭区间，返回新批次与来源实绩明细；界内明细、每条明细重复生成、编号重复、并发重复申请均 409，不留部分记录 |
+| GET | `/api/batches/{id}/refire-source` | 从复烧批次追溯来源实绩明细（非复烧批次或批次不存在返回 404）。批次列表 `GET /api/batches` 对复烧批次另带 `refire_id` 与 `refire_source_*` 字段 |
 
 过期预览确认返回示例：
 
@@ -138,6 +162,23 @@ python wsgi.py        # 或：flask --app wsgi run --host 0.0.0.0 --port 8000
     { "batch_code": "B-001", "pos_no": 1, "peak_min": 1200.0, "peak_max": 1250.0,
       "hold_min": 30, "hold_max": 45, "peak_ok": false, "hold_ok": true }
   ]
+}
+```
+
+复烧批次生成成功返回示例（`POST /api/result-items/1/refire {"code":"B-001-R"}`）：
+
+```json
+{
+  "batch": {
+    "id": 12, "code": "B-001-R", "peak_min": 1200.0, "peak_max": 1250.0,
+    "hold_min": 30, "hold_max": 45, "version": 1
+  },
+  "source": {
+    "source_batch_id": 7, "source_batch_code": "B-001", "pos_no": 1,
+    "load_id": 1, "kiln_code": "K1", "schedule_id": 1, "result_id": 1,
+    "actual_peak": 1255.0, "actual_hold": 35, "peak_ok": false, "hold_ok": true,
+    "registered_at": "2026-10-09T02:30:00.000000Z"
+  }
 }
 ```
 

@@ -130,3 +130,23 @@ CREATE TABLE IF NOT EXISTS firing_result_items (
     hold_ok     INTEGER NOT NULL CHECK (hold_ok IN (0, 1)),
     UNIQUE (result_id, batch_id)
 );
+
+-- 复烧批次：实绩中某条“峰温或保温超界”的明细可在其旁填写新编号，
+-- 生成一个待复烧的新批次（新批次继承该窑次确认清单中该批的工艺闭区间快照）。
+-- UNIQUE(result_item_id)：每条超界明细最多生成一个复烧批次，
+--                         并发重复申请在 BEGIN IMMEDIATE 内只有一个事务能提交；
+-- UNIQUE(batch_id)：每个复烧批次只对应一条来源明细。
+-- 来源实绩/窑次/安排信息在此固化记录；原确认清单与实绩判定保持原样，不新增修改路径。
+-- 复烧批次即使尚未确认也不允许删除（见 batches 删除接口），以免来源断链。
+CREATE TABLE IF NOT EXISTS refire_batches (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id            INTEGER NOT NULL UNIQUE REFERENCES batches(id),
+    result_item_id      INTEGER NOT NULL UNIQUE REFERENCES firing_result_items(id),
+    source_batch_id     INTEGER NOT NULL,
+    source_batch_code   TEXT NOT NULL,
+    result_id           INTEGER NOT NULL REFERENCES firing_results(id),
+    schedule_id         INTEGER NOT NULL REFERENCES firing_schedules(id),
+    load_id             INTEGER NOT NULL REFERENCES confirmed_loads(id),
+    kiln_id             INTEGER NOT NULL REFERENCES kilns(id),
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

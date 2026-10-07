@@ -60,6 +60,25 @@ td button { padding: 3px 8px; font-size: 12px; background: #a85a43; }
 .tag-open { background: #e2efe4; color: #2e7d4f; }
 .tag-confirmed { background: #e7e1f0; color: #5a3d8a; }
 .tag-used { background: #f6e2db; color: #a23f22; }
+.tag-refire { background: #fdeed8; color: #9a6a12; }
+
+.refire-src {
+  background: none; border: none; color: #9a6a12; padding: 0;
+  font-size: 12px; cursor: pointer; text-decoration: underline dotted;
+}
+.refire-src:hover { filter: none; color: #7a5210; }
+.refire-link {
+  background: #9a6a12; padding: 3px 8px; font-size: 11.5px; white-space: nowrap;
+}
+.refire-make { display: inline-flex; gap: 4px; align-items: center; }
+.refire-make button { background: #9a6a12; padding: 3px 8px; font-size: 11.5px; white-space: nowrap; }
+tr.flash-row td {
+  animation: flash-row 1.3s ease-in-out 2;
+}
+@keyframes flash-row {
+  0%, 100% { background: transparent; }
+  50% { background: #fbe6a8; }
+}
 
 .pos-map { display: flex; flex-wrap: wrap; gap: 6px; }
 .pos-cell {

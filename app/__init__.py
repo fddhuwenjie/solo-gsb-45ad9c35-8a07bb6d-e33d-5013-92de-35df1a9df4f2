@@ -19,6 +19,13 @@
   安排有变动则提示刷新、不生成实绩；每个安排只能登记一次，登记成功后该
   安排不得修改；并发登记或登记与排程修改交错时在 BEGIN IMMEDIATE 事务内
   按数据库最新状态裁决，失败不留部分记录。
+- 复烧批次：实绩中某条峰温或保温超界的明细，可在其旁填写新编号生成一个
+  待复烧的新批次；新批次继承该窑次确认清单中该批的工艺闭区间，并固化记录
+  来源实绩明细（新批次是普通批次，可走现有草案预览、确认、排程、实绩流程，
+  原批次仍归属原窑次，原批次之后修改范围不影响新批次）。仅超界明细可生成，
+  每条超界明细最多一个复烧批次（UNIQUE 约束 + BEGIN IMMEDIATE 兜底），
+  重复编号与并发重复申请均失败，失败不留部分记录；页面可从实绩查看新批次，
+  也可从新批次追溯来源。复烧批次即使尚未确认也不可删除，避免来源断链。
 """
 import math
 import numbers
@@ -264,10 +271,17 @@ def create_app():
     def list_batches():
         db = get_db()
         rows = db.execute(
-            """SELECT b.*, cli.load_id AS used_by_load
-               FROM batches b
-               LEFT JOIN confirmed_load_items cli ON cli.batch_id = b.id
-               ORDER BY b.id"""
+            """SELECT b.*, cli.load_id AS used_by_load,
+                      rb.id AS refire_id, rb.source_batch_code AS refire_source_batch_code,
+                      rb.source_batch_id AS refire_source_batch_id,
+                      rb.result_id AS refire_source_result_id,
+                      rb.schedule_id AS refire_source_schedule_id,
+                      rb.load_id AS refire_source_load_id,
+                      rb.kiln_id AS refire_source_kiln_id
+                 FROM batches b
+                 LEFT JOIN confirmed_load_items cli ON cli.batch_id = b.id
+                 LEFT JOIN refire_batches rb ON rb.batch_id = b.id
+                ORDER BY b.id"""
         ).fetchall()
         return jsonify([dict(r) for r in rows])
 
@@ -338,6 +352,15 @@ def create_app():
         ).fetchone()
         if used:
             return err(409, "批次已被已确认窑次使用，不可删除（确认记录不可变）")
+        refired = db.execute(
+            "SELECT 1 FROM refire_batches WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if refired:
+            return err(
+                409,
+                "该批次是由超界实绩生成的复烧批次，即使尚未确认也不可删除"
+                "（避免来源实绩断链）",
+            )
         in_draft = db.execute(
             "SELECT d.name FROM draft_items di JOIN drafts d ON d.id = di.draft_id WHERE di.batch_id = ?",
             (batch_id,),
@@ -985,15 +1008,25 @@ def create_app():
         if row is None:
             return err(404, "烧成实绩不存在")
         items = db.execute(
-            """SELECT batch_id, batch_code, pos_no, peak_min, peak_max,
-                      hold_min, hold_max, peak_ok, hold_ok
-                 FROM firing_result_items WHERE result_id = ? ORDER BY pos_no""",
+            """SELECT fri.batch_id, fri.batch_code, fri.pos_no, fri.peak_min, fri.peak_max,
+                      fri.hold_min, fri.hold_max, fri.peak_ok, fri.hold_ok,
+                      fri.id AS result_item_id,
+                      rb.id AS refire_id, rb.batch_id AS refire_batch_id,
+                      nb.code AS refire_batch_code
+                 FROM firing_result_items fri
+                 LEFT JOIN refire_batches rb ON rb.result_item_id = fri.id
+                 LEFT JOIN batches nb ON nb.id = rb.batch_id
+                WHERE fri.result_id = ? ORDER BY fri.pos_no""",
             (result_id,),
         ).fetchall()
         body = {
             **dict(row),
             "items": [
-                {**dict(r), "peak_ok": bool(r["peak_ok"]), "hold_ok": bool(r["hold_ok"])}
+                {
+                    **dict(r),
+                    "peak_ok": bool(r["peak_ok"]),
+                    "hold_ok": bool(r["hold_ok"]),
+                }
                 for r in items
             ],
         }
@@ -1092,5 +1125,154 @@ def create_app():
                 conflict=True,
             )
         return result_detail(db, result_id, created=True)
+
+    # ------------------------------------------------------------------
+    # 复烧批次（由超界实绩明细生成；继承确认清单中该批的工艺闭区间）
+    # ------------------------------------------------------------------
+
+    REFIRE_SOURCE_SELECT = """
+        SELECT rb.batch_id, rb.created_at,
+               rb.source_batch_id, rb.source_batch_code,
+               rb.result_id, rb.schedule_id, rb.load_id, rb.kiln_id,
+               k.code AS kiln_code, cl.name AS load_name,
+               fri.pos_no, fri.peak_min, fri.peak_max, fri.hold_min, fri.hold_max,
+               fri.peak_ok, fri.hold_ok,
+               fr.actual_peak, fr.actual_hold, fr.registered_at,
+               fs.start_at, fs.end_at, fs.peak_temp, fs.hold_minutes
+          FROM refire_batches rb
+          JOIN firing_result_items fri ON fri.id = rb.result_item_id
+          JOIN firing_results fr ON fr.id = fri.result_id
+          JOIN firing_schedules fs ON fs.id = fr.schedule_id
+          JOIN confirmed_loads cl ON cl.id = fs.load_id
+          JOIN kilns k ON k.id = fs.kiln_id
+    """
+
+    def refire_json(db, batch_id):
+        """复烧批次 + 来源实绩明细（用于生成返回与来源追溯）。"""
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        src = db.execute(
+            REFIRE_SOURCE_SELECT + " WHERE rb.batch_id = ?", (batch_id,)
+        ).fetchone()
+        if src is None:
+            return None
+        body = {
+            "batch": dict(row),
+            "source": {
+                **{k: src[k] for k in src.keys() if k not in ("peak_ok", "hold_ok")},
+                "peak_ok": bool(src["peak_ok"]),
+                "hold_ok": bool(src["hold_ok"]),
+            },
+        }
+        return body
+
+    @app.route("/api/result-items/<int:result_item_id>/refire", methods=["POST"])
+    def create_refire(result_item_id):
+        """为一条超界实绩明细填写新编号，生成继承原确认区间的待复烧批次。"""
+        data = json_body()
+        code = (data.get("code") or "").strip()
+        if not code:
+            return err(400, "复烧批次编号不能为空")
+
+        db = get_db()
+        try:
+            # BEGIN IMMEDIATE：并发重复申请在此排队，由 UNIQUE(result_item_id) 兜底
+            db.execute("BEGIN IMMEDIATE")
+            item = db.execute(
+                """SELECT fri.id, fri.result_id, fri.batch_id, fri.batch_code, fri.pos_no,
+                          fri.peak_min, fri.peak_max, fri.hold_min, fri.hold_max,
+                          fri.peak_ok, fri.hold_ok, fs.id AS schedule_id,
+                          fs.load_id, fs.kiln_id
+                     FROM firing_result_items fri
+                     JOIN firing_results fr ON fr.id = fri.result_id
+                     JOIN firing_schedules fs ON fs.id = fr.schedule_id
+                    WHERE fri.id = ?""",
+                (result_item_id,),
+            ).fetchone()
+            if item is None:
+                db.rollback()
+                return err(404, "实绩明细不存在")
+            if item["peak_ok"] and item["hold_ok"]:
+                db.rollback()
+                return err(
+                    409,
+                    f"批次 {item['batch_code']} 的峰温与保温均在工艺闭区间内，"
+                    "界内明细不生成复烧批次",
+                )
+            dup_item = db.execute(
+                "SELECT b.id AS batch_id, b.code AS batch_code FROM refire_batches rb"
+                " JOIN batches b ON b.id = rb.batch_id WHERE rb.result_item_id = ?",
+                (result_item_id,),
+            ).fetchone()
+            if dup_item:
+                db.rollback()
+                return err(
+                    409,
+                    f"该超界明细已生成过复烧批次 {dup_item['batch_code']}"
+                    f"（批次 #{dup_item['batch_id']}），每条超界明细最多生成一个",
+                    conflict=True,
+                )
+            dup_code = db.execute(
+                "SELECT 1 FROM batches WHERE code = ?", (code,)
+            ).fetchone()
+            if dup_code:
+                db.rollback()
+                return err(409, f"批次编号 {code} 已存在")
+            # 新批次继承该窑次确认清单中该批的工艺闭区间（即实绩判定固化的区间）
+            cur = db.execute(
+                """INSERT INTO batches(code, peak_min, peak_max, hold_min, hold_max)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    code,
+                    item["peak_min"],
+                    item["peak_max"],
+                    item["hold_min"],
+                    item["hold_max"],
+                ),
+            )
+            new_batch_id = cur.lastrowid
+            db.execute(
+                """INSERT INTO refire_batches
+                       (batch_id, result_item_id, source_batch_id, source_batch_code,
+                        result_id, schedule_id, load_id, kiln_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_batch_id,
+                    result_item_id,
+                    item["batch_id"],
+                    item["batch_code"],
+                    item["result_id"],
+                    item["schedule_id"],
+                    item["load_id"],
+                    item["kiln_id"],
+                ),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            # UNIQUE(result_item_id) / UNIQUE(batch_id) / UNIQUE(code)：并发落败方，
+            # 随事务整体回滚——新批次与来源记录都不会留下部分数据。
+            db.rollback()
+            return err(
+                409,
+                "并发冲突：该超界明细或该编号已被另一请求抢先处理，请刷新后查看",
+                conflict=True,
+            )
+        return jsonify(refire_json(db, new_batch_id)), 201
+
+    @app.route("/api/batches/<int:batch_id>/refire-source", methods=["GET"])
+    def get_refire_source(batch_id):
+        db = get_db()
+        body = refire_json(db, batch_id)
+        if body is None:
+            exists = db.execute(
+                "SELECT 1 FROM batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if not exists:
+                return err(404, "批次不存在")
+            return err(404, "该批次不是复烧批次，没有来源实绩")
+        return jsonify(body)
 
     return app
